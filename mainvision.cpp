@@ -3,33 +3,82 @@
 
 #include <QMessageBox>
 #include <QApplication>
+#include <QStandardItemModel>
+#include <algorithm>
 #include <cstring>
 
-namespace py = pybind11;
-
 // ============================================================================
-//  Kode Python (Triton gRPC) — ditanam langsung di sini
-//  SESUAIKAN: TRITON_URL, MODEL_NAME, INPUT_NAME, OUTPUT_NAME
-//  Model YOLO26m: input [1,3,640,640] FP32, output [1,300,6] (end2end, NMS-free)
+//  Kode Python (Triton gRPC) — multi server / multi model
+//  connect(url)        -> list model di server  [{name, version, state, reason}]
+//  select_model(name)  -> info model            {name, input, dtype, output, w, h, names}
+//  infer(img)          -> (K,6) x1,y1,x2,y2,conf,cls (skala input model)
 // ============================================================================
 static const char *PY_TRITON_CODE = R"PY(
 import numpy as np
 import tritonclient.grpc as grpcclient
 
-TRITON_URL  = "140.129.7.181:8001"
-MODEL_NAME  = "yolo26m"
-INPUT_NAME  = "images"
-OUTPUT_NAME = "output0"
-CONF_THRES  = 0.25
-IOU_THRES   = 0.45
+CONF_THRES = 0.25
+IOU_THRES  = 0.45
+TIMEOUT    = 5.0     # detik, buat query metadata
+INFER_TO   = 15.0    # detik, buat inference
 
 _client = None
+_url    = None
+_model  = None
 
-def _get_client():
-    global _client
+def connect(url):
+    global _client, _url, _model
+    url = url.strip()
+    if ":" not in url:
+        url += ":8001"                     # default port gRPC
+    c = grpcclient.InferenceServerClient(url=url)
+    if not c.is_server_live(client_timeout=TIMEOUT):
+        raise RuntimeError("Server tidak live: " + url)
+    _client, _url, _model = c, url, None
+
+    idx = c.get_model_repository_index(as_json=True, client_timeout=TIMEOUT)
+    models = []
+    for m in idx.get("models", []):
+        models.append({
+            "name":    m.get("name", ""),
+            "version": m.get("version", ""),
+            "state":   m.get("state", "UNKNOWN"),
+            "reason":  m.get("reason", ""),
+        })
+    models.sort(key=lambda m: m["name"])
+    return models
+
+def select_model(name):
+    global _model
     if _client is None:
-        _client = grpcclient.InferenceServerClient(url=TRITON_URL)
-    return _client
+        raise RuntimeError("Belum connect ke server")
+    if not _client.is_model_ready(name, client_timeout=TIMEOUT):
+        raise RuntimeError(f"Model '{name}' belum READY")
+
+    meta = _client.get_model_metadata(name, as_json=True, client_timeout=TIMEOUT)
+    cfg  = _client.get_model_config(name, as_json=True, client_timeout=TIMEOUT).get("config", {})
+
+    inp = meta["inputs"][0]
+    out = meta["outputs"][0]
+    shape = [int(s) for s in inp["shape"]]      # mis. [-1,3,640,640]
+    h = shape[-2] if len(shape) >= 2 and shape[-2] > 0 else 640
+    w = shape[-1] if len(shape) >= 1 and shape[-1] > 0 else 640
+
+    # Opsional: nama kelas dari config.pbtxt -> parameters { key:"names" value { string_value:"a,b,c" } }
+    names = []
+    p = cfg.get("parameters", {}).get("names")
+    if p:
+        names = [s.strip() for s in p.get("string_value", "").split(",") if s.strip()]
+
+    _model = {
+        "name":   name,
+        "input":  inp["name"],
+        "dtype":  inp["datatype"],
+        "output": out["name"],
+        "w": w, "h": h,
+        "names": names,
+    }
+    return dict(_model)
 
 def _nms(boxes, scores, iou_thres):
     x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
@@ -48,23 +97,28 @@ def _nms(boxes, scores, iou_thres):
     return np.array(keep, dtype=np.int64)
 
 def infer(img):
-    # img: uint8 RGB (640,640,3), sudah di-letterbox dari C++
+    # img: uint8 RGB (H,W,3), sudah di-letterbox dari C++ sesuai ukuran model
+    if _client is None or _model is None:
+        raise RuntimeError("Server/model belum dipilih")
+
     x = img.astype(np.float32) / 255.0
     x = np.ascontiguousarray(x.transpose(2, 0, 1)[None])
+    if _model["dtype"] == "FP16":
+        x = x.astype(np.float16)
 
-    inp = grpcclient.InferInput(INPUT_NAME, list(x.shape), "FP32")
+    inp = grpcclient.InferInput(_model["input"], list(x.shape), _model["dtype"])
     inp.set_data_from_numpy(x)
-    out = grpcclient.InferRequestedOutput(OUTPUT_NAME)
-    res = _get_client().infer(MODEL_NAME, [inp], outputs=[out])
+    out = grpcclient.InferRequestedOutput(_model["output"])
+    res = _client.infer(_model["name"], [inp], outputs=[out], client_timeout=INFER_TO)
 
-    pred = res.as_numpy(OUTPUT_NAME)[0]
+    pred = res.as_numpy(_model["output"])[0].astype(np.float32)
 
-    # YOLO26 end-to-end (default): (300, 6) = x1,y1,x2,y2,conf,cls -> cukup filter conf
+    # End-to-end (YOLO26 default): (N, 6) = x1,y1,x2,y2,conf,cls
     if pred.ndim == 2 and pred.shape[1] == 6:
         det = pred[pred[:, 4] > CONF_THRES]
         return np.ascontiguousarray(det, dtype=np.float32)
 
-    # Fallback: export end2end=False -> (4+nc, N), xywh, butuh NMS
+    # Raw head: (4+nc, N) xywh -> butuh NMS
     if pred.shape[0] < pred.shape[1]:
         pred = pred.T
 
@@ -85,10 +139,17 @@ def infer(img):
     keep = _nms(xyxy + cls[:, None] * 4096.0, conf, IOU_THRES)  # class-aware
     det = np.concatenate([xyxy[keep], conf[keep, None],
                           cls[keep, None].astype(np.float32)], axis=1)
-    return det.astype(np.float32)   # (K,6): x1,y1,x2,y2,conf,cls (skala 640)
+    return det.astype(np.float32)
 )PY";
 
-static constexpr int INFER_SIZE = 640;
+static const char *DEFAULT_SERVER = "140.129.7.181:8001";
+
+namespace {
+struct WaitCursor {
+    WaitCursor()  { QApplication::setOverrideCursor(Qt::WaitCursor); }
+    ~WaitCursor() { QApplication::restoreOverrideCursor(); }
+};
+}
 
 // ============================================================================
 
@@ -98,7 +159,14 @@ mainvision::mainvision(QWidget *parent)
 {
     ui->setupUi(this);
 
-    // classNames = {"ok", "scratch", "dent"};   // opsional
+    ui->lineEditServer->setText(DEFAULT_SERVER);
+    ui->lineEditServer->setPlaceholderText("IP[:port]  (default port 8001)");
+    ui->comboBoxModel->setEnabled(false);
+    ui->pushButtonSelectModel->setEnabled(false);
+
+    // Enter di lineEdit = connect
+    connect(ui->lineEditServer, &QLineEdit::returnPressed,
+            this, &mainvision::on_pushButtonSelectServer_pressed);
 
     QString pyErr;
     if (!initPython(pyErr)) {
@@ -122,17 +190,31 @@ mainvision::~mainvision()
     timer->stop();
     if (cap.isOpened())
         cap.release();
-    pyInfer = py::object();   // lepas ref Python sebelum interpreter mati
+    // lepas ref Python sebelum interpreter mati
+    pyInfer = py::object();
+    pySelectModel = py::object();
+    pyConnect = py::object();
     delete ui;
 }
 
 // ---------------------------------------------------------------- Python ----
+QString mainvision::pyErrText(const py::error_already_set &e)
+{
+    try {
+        return QString::fromStdString(py::str(e.value()).cast<std::string>());
+    } catch (...) {
+        return QString::fromUtf8(e.what());
+    }
+}
+
 bool mainvision::initPython(QString &err)
 {
     try {
         py::dict ns;
         py::exec(PY_TRITON_CODE, ns);
-        pyInfer = ns["infer"];
+        pyConnect     = ns["connect"];
+        pySelectModel = ns["select_model"];
+        pyInfer       = ns["infer"];
         return true;
     } catch (const py::error_already_set &e) {
         err = QString::fromUtf8(e.what());
@@ -163,7 +245,7 @@ void mainvision::softReloadCamera()
 
     if (cap.isOpened()) {
         for (int i = 0; i < 5; ++i)
-            cap.grab();                    // flush buffer
+            cap.grab();
 
         cv::Mat test;
         if (cap.read(test) && !test.empty()) {
@@ -192,7 +274,7 @@ void mainvision::updatePlayer()
     if (frame.empty())
         return;
 
-    liveFrame = frame;   // simpan BGR buat capture
+    liveFrame = frame;
     showMat(frame);
 }
 
@@ -217,25 +299,33 @@ cv::Mat mainvision::runInference(const cv::Mat &bgr, QString &err, int &nDet)
         err = "Triton client belum siap (initPython gagal).";
         return {};
     }
+    if (!serverConnected) {
+        err = "Belum connect ke server.";
+        return {};
+    }
+    if (!modelReady) {
+        err = "Belum pilih model.";
+        return {};
+    }
 
-    // Letterbox ke 640x640
-    const float r = std::min(INFER_SIZE / static_cast<float>(bgr.rows),
-                             INFER_SIZE / static_cast<float>(bgr.cols));
+    // Letterbox ke ukuran input model
+    const float r = std::min(inferW / static_cast<float>(bgr.cols),
+                             inferH / static_cast<float>(bgr.rows));
     const int nw = static_cast<int>(std::round(bgr.cols * r));
     const int nh = static_cast<int>(std::round(bgr.rows * r));
-    const int padX = (INFER_SIZE - nw) / 2;
-    const int padY = (INFER_SIZE - nh) / 2;
+    const int padX = (inferW - nw) / 2;
+    const int padY = (inferH - nh) / 2;
 
     cv::Mat resized;
     cv::resize(bgr, resized, cv::Size(nw, nh));
-    cv::Mat lb(INFER_SIZE, INFER_SIZE, CV_8UC3, cv::Scalar(114, 114, 114));
+    cv::Mat lb(inferH, inferW, CV_8UC3, cv::Scalar(114, 114, 114));
     resized.copyTo(lb(cv::Rect(padX, padY, nw, nh)));
     cv::cvtColor(lb, lb, cv::COLOR_BGR2RGB);
 
     cv::Mat out = bgr.clone();
 
     try {
-        py::array_t<uint8_t> arr(std::vector<py::ssize_t>{INFER_SIZE, INFER_SIZE, 3});
+        py::array_t<uint8_t> arr(std::vector<py::ssize_t>{inferH, inferW, 3});
         std::memcpy(arr.mutable_data(), lb.data, lb.total() * lb.elemSize());
 
         auto det = pyInfer(arr).cast<py::array_t<float, py::array::c_style | py::array::forcecast>>();
@@ -268,6 +358,9 @@ cv::Mat mainvision::runInference(const cv::Mat &bgr, QString &err, int &nDet)
                         cv::Scalar(0, 0, 0), 2);
         }
     } catch (const py::error_already_set &e) {
+        err = pyErrText(e);
+        return {};
+    } catch (const std::exception &e) {
         err = QString::fromUtf8(e.what());
         return {};
     }
@@ -282,19 +375,24 @@ void mainvision::on_pushCapture_pressed()
         QMessageBox::warning(this, "Capture", "Belum ada frame dari kamera.");
         return;
     }
+    if (!modelReady) {
+        QMessageBox::warning(this, "Capture", "Connect server dan pilih model dulu.");
+        return;
+    }
 
-    // Freeze live view
     liveMode = false;
     timer->stop();
     capturedFrame = liveFrame.clone();
     inferencedFrame.release();
     showMat(capturedFrame);
 
-    QApplication::setOverrideCursor(Qt::WaitCursor);
     QString err;
     int nDet = 0;
-    cv::Mat result = runInference(capturedFrame, err, nDet);
-    QApplication::restoreOverrideCursor();
+    cv::Mat result;
+    {
+        WaitCursor wc;
+        result = runInference(capturedFrame, err, nDet);
+    }
 
     if (result.empty()) {
         QMessageBox::critical(this, "Inference Error", err);
@@ -303,7 +401,7 @@ void mainvision::on_pushCapture_pressed()
 
     inferencedFrame = result;
     showMat(inferencedFrame);
-    statusBar()->showMessage(QString("Deteksi: %1 objek").arg(nDet), 5000);
+    statusBar()->showMessage(QString("[%1] Deteksi: %2 objek").arg(currentModel).arg(nDet), 5000);
 }
 
 void mainvision::on_pushReloadCam_pressed()
@@ -327,4 +425,116 @@ void mainvision::on_pushOriginalImage_pressed()
     liveMode = false;
     timer->stop();
     showMat(capturedFrame);
+}
+
+// ---------------------------------------------------------------- Server ----
+void mainvision::on_pushButtonSelectServer_pressed()
+{
+    if (!pyConnect) {
+        QMessageBox::critical(this, "Server", "Triton client belum siap (initPython gagal).");
+        return;
+    }
+
+    const QString url = ui->lineEditServer->text().trimmed();
+    if (url.isEmpty()) {
+        QMessageBox::warning(this, "Server", "Isi IP server dulu.");
+        return;
+    }
+
+    serverConnected = false;
+    modelReady = false;
+    currentModel.clear();
+    classNames.clear();
+    ui->comboBoxModel->clear();
+    ui->comboBoxModel->setEnabled(false);
+    ui->pushButtonSelectModel->setEnabled(false);
+
+    py::list models;
+    try {
+        WaitCursor wc;
+        models = pyConnect(url.toStdString()).cast<py::list>();
+    } catch (const py::error_already_set &e) {
+        QMessageBox::critical(this, "Server", "Gagal connect ke " + url + ":\n" + pyErrText(e));
+        return;
+    }
+
+    auto *itemModel = qobject_cast<QStandardItemModel *>(ui->comboBoxModel->model());
+    int readyCount = 0;
+
+    for (auto h : models) {
+        py::dict m = h.cast<py::dict>();
+        const QString name  = QString::fromStdString(m["name"].cast<std::string>());
+        const QString state = QString::fromStdString(m["state"].cast<std::string>());
+        const bool ready = (state == "READY");
+
+        ui->comboBoxModel->addItem(ready ? name : QString("%1  (%2)").arg(name, state), name);
+        if (!ready && itemModel)
+            itemModel->item(ui->comboBoxModel->count() - 1)->setEnabled(false);
+        else
+            ++readyCount;
+    }
+
+    serverConnected = true;
+
+    if (readyCount == 0) {
+        QMessageBox::warning(this, "Server", "Terhubung, tapi tidak ada model READY di server.");
+        return;
+    }
+
+    // Pilih item READY pertama
+    for (int i = 0; i < ui->comboBoxModel->count(); ++i) {
+        if (!itemModel || itemModel->item(i)->isEnabled()) {
+            ui->comboBoxModel->setCurrentIndex(i);
+            break;
+        }
+    }
+
+    ui->comboBoxModel->setEnabled(true);
+    ui->pushButtonSelectModel->setEnabled(true);
+    statusBar()->showMessage(QString("Terhubung ke %1 — %2 model READY").arg(url).arg(readyCount), 5000);
+}
+
+// ----------------------------------------------------------------- Model ----
+void mainvision::on_pushButtonSelectModel_pressed()
+{
+    if (!serverConnected || ui->comboBoxModel->count() == 0) {
+        QMessageBox::warning(this, "Model", "Connect ke server dulu.");
+        return;
+    }
+
+    const QString name = ui->comboBoxModel->currentData().toString();
+    if (name.isEmpty())
+        return;
+
+    modelReady = false;
+
+    py::dict info;
+    try {
+        WaitCursor wc;
+        info = pySelectModel(name.toStdString()).cast<py::dict>();
+    } catch (const py::error_already_set &e) {
+        QMessageBox::critical(this, "Model", "Gagal pilih model '" + name + "':\n" + pyErrText(e));
+        return;
+    }
+
+    inferW = info["w"].cast<int>();
+    inferH = info["h"].cast<int>();
+
+    classNames.clear();
+    for (auto n : info["names"].cast<py::list>())
+        classNames << QString::fromStdString(n.cast<std::string>());
+
+    currentModel = name;
+    modelReady = true;
+
+    setWindowTitle(QString("Vision QC — %1").arg(name));
+    statusBar()->showMessage(
+        QString("Model %1 aktif | input %2 (%3x%4, %5) | output %6 | %7 kelas")
+            .arg(name,
+                 QString::fromStdString(info["input"].cast<std::string>()))
+            .arg(inferW).arg(inferH)
+            .arg(QString::fromStdString(info["dtype"].cast<std::string>()),
+                 QString::fromStdString(info["output"].cast<std::string>()))
+            .arg(classNames.isEmpty() ? QString("?") : QString::number(classNames.size())),
+        8000);
 }

@@ -7,7 +7,7 @@
     <x>0</x>
     <y>0</y>
     <width>1406</width>
-    <height>800</height>
+    <height>781</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -18,6 +18,23 @@
     <item>
      <layout class="QVBoxLayout" name="verticalLayout">
       <item>
+       <widget class="QLineEdit" name="lineEditServer">
+        <property name="sizePolicy">
+         <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
+          <horstretch>0</horstretch>
+          <verstretch>0</verstretch>
+         </sizepolicy>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="pushButtonSelectServer">
+        <property name="text">
+         <string>Connect</string>
+        </property>
+       </widget>
+      </item>
+      <item>
        <widget class="QPushButton" name="pushCapture">
         <property name="sizePolicy">
          <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
@@ -26,7 +43,8 @@
          </sizepolicy>
         </property>
         <property name="text">
-         <string>Capture Camera</string>
+         <string>Capture Camera  
+拍攝相機</string>
         </property>
        </widget>
       </item>
@@ -39,7 +57,8 @@
          </sizepolicy>
         </property>
         <property name="text">
-         <string>Reload Camera</string>
+         <string>Reload Camera
+重新載入攝影機</string>
         </property>
        </widget>
       </item>
@@ -52,7 +71,8 @@
          </sizepolicy>
         </property>
         <property name="text">
-         <string>Inferenced Image</string>
+         <string>Inferenced Image
+推理圖像</string>
         </property>
        </widget>
       </item>
@@ -65,7 +85,18 @@
          </sizepolicy>
         </property>
         <property name="text">
-         <string>Original Image</string>
+         <string>Original Image
+原圖</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QComboBox" name="comboBoxModel"/>
+      </item>
+      <item>
+       <widget class="QPushButton" name="pushButtonSelectModel">
+        <property name="text">
+         <string>SELECT</string>
         </property>
        </widget>
       </item>
